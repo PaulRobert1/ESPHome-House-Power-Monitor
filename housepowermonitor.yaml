@@ -1,0 +1,529 @@
+esphome:
+  name: housepowermonitor
+  friendly_name: HousePowerMonitor
+
+  on_boot:
+    priority: 250.0
+    then:
+      # Start on the voltage/current display page.
+      - binary_sensor.template.publish:
+          id: page
+          state: ON
+
+      - text_sensor.template.publish:
+          id: status
+          state: "initializing"
+
+      # Allow the CSE7766 to provide valid measurements.
+      - delay: 3s
+
+      # Synchronize the software switch with the bistable relay.
+      - if:
+          condition:
+            lambda: |-
+              return !isnan(id(v_sensor).state) &&
+                     !isnan(id(a_sensor).state) &&
+                     id(v_sensor).state > 10.0f &&
+                     id(a_sensor).state <= 20.0f;
+          then:
+            - switch.turn_on: relay_1
+
+            - text_sensor.template.publish:
+                id: status
+                state: "normal"
+
+          else:
+            # Force the physical bistable relay OFF when the
+            # measurements are invalid, the input is open, or
+            # an overcurrent condition exists.
+            - switch.turn_off: relay_1
+
+            - text_sensor.template.publish:
+                id: status
+                state: !lambda |-
+                  if (isnan(id(v_sensor).state) ||
+                      isnan(id(a_sensor).state)) {
+                    return {"sensor error"};
+                  }
+
+                  if (id(a_sensor).state > 20.0f) {
+                    return {"short"};
+                  }
+
+                  return {"open"};
+
+      - lambda: |-
+          id(startup_complete) = true;
+
+
+esp32:
+  variant: esp32
+
+  framework:
+    type: esp-idf
+
+  toolchain: esp-idf
+
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+
+wifi:
+  networks:
+    - ssid: !secret wifi_networks_ssid
+      password: !secret wifi_networks_password
+
+  use_address: housepowermonitor.local
+
+  manual_ip:
+    gateway: !secret wifi_manual_ip_gateway
+    subnet: !secret wifi_manual_ip_subnet
+    static_ip: !secret wifi_manual_ip_static_ip
+
+
+logger:
+  # GPIO UART is used by the CSE7766.
+  baud_rate: 0
+
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1100ms
+    window: 1100ms
+    active: true
+
+
+bluetooth_proxy:
+  active: true
+
+
+uart:
+  rx_pin: GPIO16
+  baud_rate: 4800
+  parity: EVEN
+
+
+globals:
+  - id: startup_complete
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+
+sensor:
+  # Sonoff POW Elite CSE7766 power-monitoring chip.
+  - platform: cse7766
+    current:
+      name: Current
+      id: a_sensor
+
+    voltage:
+      name: Voltage
+      id: v_sensor
+
+    power:
+      name: Power
+      id: w_sensor
+
+      on_value_range:
+        - above: 4.0
+          then:
+            - light.turn_on: switch_led
+
+        - below: 3.0
+          then:
+            - light.turn_off: switch_led
+
+    energy:
+      name: Energy
+      id: wh_sensor
+
+
+  - platform: total_daily_energy
+    name: Total Daily Energy
+    power_id: w_sensor
+
+    filters:
+      - multiply: 0.001
+
+    unit_of_measurement: kWh
+
+
+  - platform: wifi_signal
+    name: Wifi RSSI
+    update_interval: 60s
+
+
+  # Replaces the Arduino-only temperatureRead() lambda.
+  - platform: internal_temperature
+    name: ESP32 Internal Temp
+    id: esp32_temp
+    update_interval: 60s
+
+
+  - platform: template
+    name: Power Factor
+    device_class: power_factor
+    id: power_factor
+    accuracy_decimals: 2
+    update_interval: 5s
+
+    lambda: |-
+      const float voltage = id(v_sensor).state;
+      const float current = id(a_sensor).state;
+      const float power = id(w_sensor).state;
+
+      if (isnan(voltage) ||
+          isnan(current) ||
+          isnan(power) ||
+          voltage <= 0.0f ||
+          current <= 0.01f) {
+        return NAN;
+      }
+
+      const float pf = power / (voltage * current);
+
+      if (pf < 0.0f) {
+        return NAN;
+      }
+
+      // Prevent measurement noise from reporting values above 1.00.
+      return pf > 1.0f ? 1.0f : pf;
+
+
+binary_sensor:
+  # Physical front button.
+  - platform: gpio
+    pin:
+      number: GPIO00
+      ignore_strapping_warning: true
+
+    id: reset
+    internal: true
+
+    filters:
+      - invert:
+      - delayed_off: 10ms
+
+    on_click:
+      # Short press: toggle power relay.
+      - max_length: 350ms
+        then:
+          - switch.toggle: relay_1
+
+      # Long press: switch display page.
+      - min_length: 360ms
+        max_length: 3s
+        then:
+          - if:
+              condition:
+                binary_sensor.is_on: page
+
+              then:
+                - binary_sensor.template.publish:
+                    id: page
+                    state: OFF
+
+              else:
+                - binary_sensor.template.publish:
+                    id: page
+                    state: ON
+
+
+  # Internal display-page state.
+  - platform: template
+    id: page
+    internal: true
+
+
+  - platform: template
+    name: Load
+    id: load_on
+
+    lambda: |-
+      if (isnan(id(w_sensor).state)) {
+        return {};
+      }
+
+      return id(w_sensor).state > 4.0f;
+
+
+display:
+  platform: tm1621
+  id: tm1621_display
+
+  cs_pin: GPIO25
+  data_pin: GPIO14
+  read_pin: GPIO26
+  write_pin: GPIO27
+
+  update_interval: 1s
+
+  lambda: |-
+    const float voltage =
+        isnan(id(v_sensor).state) ? 0.0f : id(v_sensor).state;
+
+    const float current =
+        isnan(id(a_sensor).state) ? 0.0f : id(a_sensor).state;
+
+    const float power =
+        isnan(id(w_sensor).state) ? 0.0f : id(w_sensor).state;
+
+    // CSE7766 energy is reported in Wh. Convert it to kWh
+    // because the LCD displays the kWh indicator.
+    const float energy_kwh =
+        isnan(id(wh_sensor).state)
+            ? 0.0f
+            : id(wh_sensor).state / 1000.0f;
+
+    if (id(page).state) {
+      // Page 1: voltage and current.
+      it.display_voltage(true);
+      it.display_kwh(false);
+
+      it.printf(0, "%.1f", voltage);
+      it.printf(1, "%.1f", current);
+
+    } else {
+      // Page 2: accumulated energy and current power.
+      it.display_voltage(false);
+      it.display_kwh(true);
+
+      it.printf(0, "%.1f", energy_kwh);
+      it.printf(1, "%.1f", power);
+    }
+
+
+output:
+  - platform: ledc
+    id: led
+
+    pin:
+      number: GPIO18
+      inverted: true
+
+
+switch:
+  # User-facing power switch.
+  - platform: template
+    name: Power
+    id: relay_1
+    optimistic: true
+
+    turn_off_action:
+      - switch.turn_on: relay_off
+
+    turn_on_action:
+      - switch.turn_on: relay_on
+
+
+  # Bistable relay OFF coil.
+  - platform: gpio
+    id: relay_off
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+    pin: GPIO04
+
+    interlock:
+      - relay_on
+
+    on_turn_on:
+      - delay: 500ms
+      - switch.turn_off: relay_off
+      - light.turn_off: switch_led
+
+
+  # Bistable relay ON coil.
+  - platform: gpio
+    id: relay_on
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+    pin:
+      number: GPIO02
+      ignore_strapping_warning: true
+
+    interlock:
+      - relay_off
+
+    on_turn_on:
+      - delay: 500ms
+      - switch.turn_off: relay_on
+      - light.turn_on: switch_led
+
+
+  - platform: restart
+    name: Device Restart
+
+
+text_sensor:
+  # Native human-readable uptime sensor.
+  - platform: uptime
+    name: Uptime
+    id: uptime_human
+    icon: mdi:clock-start
+    update_interval: 1s
+
+    format:
+      separator: " "
+      days: "d"
+      hours: "h"
+      minutes: "m"
+      seconds: "s"
+
+
+  - platform: wifi_info
+    ip_address:
+      name: IP
+
+    ssid:
+      name: SSID
+
+    bssid:
+      name: BSSID
+
+
+  - platform: template
+    name: Status
+    id: status
+    icon: mdi:alert
+
+
+light:
+  - platform: monochromatic
+    id: switch_led
+    output: led
+    internal: true
+
+
+  - platform: status_led
+    id: wifi_status_led
+    internal: true
+
+    pin:
+      number: GPIO05
+      inverted: true
+      ignore_strapping_warning: true
+
+
+script:
+  # Protection script uses mode: single so multiple interval calls
+  # cannot create overlapping 20-second delays.
+  - id: protection_check
+    mode: single
+
+    then:
+      # Invalid CSE7766 readings.
+      - if:
+          condition:
+            lambda: |-
+              return isnan(id(v_sensor).state) ||
+                     isnan(id(a_sensor).state);
+
+          then:
+            - if:
+                condition:
+                  switch.is_on: relay_1
+
+                then:
+                  - switch.turn_off: relay_1
+
+            - text_sensor.template.publish:
+                id: status
+                state: "sensor error"
+
+          else:
+            # Overcurrent protection.
+            - if:
+                condition:
+                  lambda: |-
+                    return id(a_sensor).state > 20.0f;
+
+                then:
+                  - if:
+                      condition:
+                        switch.is_on: relay_1
+
+                      then:
+                        - switch.turn_off: relay_1
+
+                  - text_sensor.template.publish:
+                      id: status
+                      state: "short"
+
+                  # Prevent repeated protection processing.
+                  - delay: 20s
+
+                else:
+                  # Voltage is present and current is within range.
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(v_sensor).state > 10.0f;
+
+                      then:
+                        # Only pulse the bistable relay if its
+                        # software state is currently OFF.
+                        - if:
+                            condition:
+                              switch.is_off: relay_1
+
+                            then:
+                              - switch.turn_on: relay_1
+
+                        - text_sensor.template.publish:
+                            id: status
+                            state: "normal"
+
+                      else:
+                        # No output voltage: relay/open circuit.
+                        - if:
+                            condition:
+                              switch.is_on: relay_1
+
+                            then:
+                              - switch.turn_off: relay_1
+
+                        - text_sensor.template.publish:
+                            id: status
+                            state: "open"
+
+
+interval:
+  # Wi-Fi status indicator.
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            wifi.connected:
+
+          then:
+            - light.turn_on: wifi_status_led
+
+          else:
+            - light.turn_off: wifi_status_led
+
+
+  # Current and short-circuit protection.
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(startup_complete);
+
+          then:
+            - script.execute: protection_check
